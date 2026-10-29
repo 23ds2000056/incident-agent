@@ -587,7 +587,7 @@ def build_fallback_plan(
                 for word in ("query", "metric", "log", "trace")
             )
         ),
-        tool_catalog["name"],[0]
+        tool_catalog["name"][0],
     )
 
     effect_tools = policy.get("effectTools", [])
@@ -608,7 +608,7 @@ def build_fallback_plan(
         raise ValueError("No allowed root causes")
 
     return {
-        "rootCause": allowed_causes,[0]
+        "rootCause": allowed_causes[0],
         "evidence": evidence_ids[:2],
         "diagnostics": [
             {
@@ -617,7 +617,7 @@ def build_fallback_plan(
                     "incidentId": incident.get("incidentId", ""),
                     "service": incident.get("service", ""),
                 },
-                "evidence": [evidence_ids],[0]
+                "evidence": [evidence_ids][0],
             }
         ],
         "effect": {
