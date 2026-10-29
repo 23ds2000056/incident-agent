@@ -448,6 +448,24 @@ def extract_evidence_transcript(
     return "\n".join(lines[:max_lines])
 
 
+def extract_evidence_ids(
+    transcript: str,
+    limit: int = 10,
+) -> list[str]:
+    ids = []
+
+    for match in re.finditer(r"\[([^\]\s]+)\]", transcript or ""):
+        evidence_id = match.group(1).strip()
+
+        if evidence_id and evidence_id not in ids:
+            ids.append(evidence_id)
+
+        if len(ids) >= limit:
+            break
+
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # AI planner
 # ---------------------------------------------------------------------------
@@ -514,6 +532,95 @@ def extract_json_object(text: str) -> dict:
             raise
 
         return json.loads(text[start:end + 1])
+
+
+def choose_permitted_effect(effect: dict, policy: dict) -> dict:
+    effect_tools = policy.get("effectTools", [])
+
+    if not effect_tools:
+        raise ValueError("No permitted effect tools")
+
+    chosen_effect = effect.get("toolName")
+
+    if chosen_effect not in effect_tools:
+        non_destructive = [
+            tool for tool in effect_tools
+            if tool not in DESTRUCTIVE_TOOLS
+        ]
+
+        chosen_effect = (
+            non_destructive[0]
+            if non_destructive
+            else effect_tools[0]
+        )
+
+    effect["toolName"] = chosen_effect
+
+    if not isinstance(effect.get("arguments"), dict):
+        effect["arguments"] = {}
+
+    return effect
+
+
+def build_fallback_plan(
+    incident: dict,
+    tool_catalog: list,
+    policy: dict,
+) -> dict:
+    evidence_ids = extract_evidence_ids(
+        incident.get("transcript", ""),
+        limit=4,
+    )
+
+    if len(evidence_ids) < 2:
+        raise ValueError("Not enough evidence IDs for fallback plan")
+
+    diagnostic_tool = next(
+        (
+            tool["name"]
+            for tool in tool_catalog
+            if any(
+                word in tool["name"].lower()
+                for word in ("query", "metric", "log", "trace")
+            )
+        ),
+        tool_catalog["name"],[0]
+    )
+
+    effect_tools = policy.get("effectTools", [])
+
+    if not effect_tools:
+        raise ValueError("No permitted effect tools")
+
+    non_destructive = [
+        tool for tool in effect_tools
+        if tool not in DESTRUCTIVE_TOOLS
+    ]
+
+    effect_tool = non_destructive if non_destructive else effect_tools[0]
+
+    return {
+        "rootCause": incident["allowedRootCauses"],[0]
+        "evidence": evidence_ids[:2],
+        "diagnostics": [
+            {
+                "toolName": diagnostic_tool,
+                "arguments": {
+                    "incidentId": incident.get("incidentId"),
+                    "service": incident.get("service"),
+                },
+                "evidence": [evidence_ids],[0]
+            }
+        ],
+        "effect": {
+            "toolName": effect_tool,
+            "arguments": {
+                "incidentId": incident.get("incidentId"),
+                "service": incident.get("service"),
+            },
+            "justification": "Fallback remediation based on available evidence",
+        },
+    }
 
 
 async def call_model_planner(
@@ -589,7 +696,7 @@ async def call_model_planner(
         response.raise_for_status()
 
         data = response.json()
-        content = data["choices"][0]["message"]["content"]
+        content = data["choices"]["message"]["content"][0]
         plan = extract_json_object(content)
 
     except httpx.HTTPStatusError as exc:
@@ -606,52 +713,68 @@ async def call_model_planner(
         print("=============================\n")
         raise
 
-    allowed_causes = incident.get("allowedRootCauses", [])
+    try:
+        allowed_causes = incident.get("allowedRootCauses", [])
 
-    if plan.get("rootCause") not in allowed_causes:
-        if allowed_causes:
-            plan["rootCause"] = allowed_causes[0]
-        else:
-            raise ValueError("No allowedRootCauses supplied")
+        if plan.get("rootCause") not in allowed_causes:
+            if allowed_causes:
+                plan["rootCause"] = allowed_causes[0]
+            else:
+                raise ValueError("No allowedRootCauses supplied")
 
-    evidence = plan.get("evidence") or []
-    evidence = [
-        item
-        for item in evidence
-        if isinstance(item, str) and item
-    ]
-    evidence = list(dict.fromkeys(evidence))[:4]
+        evidence = plan.get("evidence") or []
+        evidence = [
+            item
+            for item in evidence
+            if isinstance(item, str) and item
+        ]
+        evidence = list(dict.fromkeys(evidence))
 
-    if len(evidence) < 2:
-        raise ValueError("Model did not provide two evidence IDs")
+        transcript_evidence_ids = extract_evidence_ids(
+            incident.get("transcript", "")
+        )
 
-    plan["evidence"] = evidence
+        for evidence_id in transcript_evidence_ids:
+            if len(evidence) >= 2:
+                break
+            if evidence_id not in evidence:
+                evidence.append(evidence_id)
 
-    diagnostics = plan.get("diagnostics") or []
-    diagnostics = [
-        item
-        for item in diagnostics
-        if isinstance(item, dict)
-        and item.get("toolName")
-        and isinstance(item.get("arguments"), dict)
-    ]
+        evidence = evidence[:4]
 
-    if not diagnostics:
-        raise ValueError("Model did not provide a valid diagnostic")
+        if len(evidence) < 2:
+            raise ValueError("Transcript did not contain two evidence IDs")
 
-    plan["diagnostics"] = diagnostics[:3]
+        plan["evidence"] = evidence
 
-    effect = plan.get("effect") or {}
+        diagnostics = plan.get("diagnostics") or []
+        diagnostics = [
+            item
+            for item in diagnostics
+            if isinstance(item, dict)
+            and item.get("toolName")
+            and isinstance(item.get("arguments"), dict)
+        ]
 
-    if effect.get("toolName") not in policy.get("effectTools", []):
-        raise ValueError("Effect tool is not permitted")
+        if not diagnostics:
+            raise ValueError("Model did not provide a valid diagnostic")
 
-    if not isinstance(effect.get("arguments"), dict):
-        effect["arguments"] = {}
+        plan["diagnostics"] = diagnostics[:3]
 
-    plan["effect"] = effect
+        plan["effect"] = choose_permitted_effect(
+            plan.get("effect") or {},
+            policy,
+        )
 
-    return plan
+        return plan
+
+    except Exception as exc:
+        print("DEBUG: model plan invalid, using fallback:", repr(exc))
+        return build_fallback_plan(
+            incident,
+            tool_catalog,
+            policy,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +840,7 @@ def initial_dispatches(
         ]
 
         if not cited_evidence:
-            cited_evidence = [plan["evidence"][0]]
+            cited_evidence = [plan["evidence"]][0]
 
         action_id = new_id(f"diag_{index}")
         call_id = action_id
