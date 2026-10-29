@@ -600,7 +600,7 @@ def build_fallback_plan(
     effect_tool = non_destructive if non_destructive else effect_tools[0]
 
     return {
-        "rootCause": incident["allowedRootCauses"],[0]
+        "rootCause": incident["allowedRootCauses"][0],
         "evidence": evidence_ids[:2],
         "diagnostics": [
             {
