@@ -587,7 +587,7 @@ def build_fallback_plan(
                 for word in ("query", "metric", "log", "trace")
             )
         ),
-        tool_catalog["name"][0],
+        tool_catalog[0]["name"],
     )
 
     effect_tools = policy.get("effectTools", [])
@@ -704,7 +704,7 @@ async def call_model_planner(
         response.raise_for_status()
 
         data = response.json()
-        content = data["choices"]["message"]["content"][0]
+        content = data["choices"][0]["message"]["content"]
         plan = extract_json_object(content)
 
     except httpx.HTTPStatusError as exc:
