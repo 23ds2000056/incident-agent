@@ -575,12 +575,15 @@ def build_fallback_plan(
     if len(evidence_ids) < 2:
         raise ValueError("Not enough evidence IDs for fallback plan")
 
+    if not tool_catalog:
+        raise ValueError("No diagnostic tools available")
+
     diagnostic_tool = next(
         (
             tool["name"]
             for tool in tool_catalog
             if any(
-                word in tool["name"].lower()
+                word in str(tool.get("name", "")).lower()
                 for word in ("query", "metric", "log", "trace")
             )
         ),
@@ -599,24 +602,29 @@ def build_fallback_plan(
 
     effect_tool = non_destructive if non_destructive else effect_tools[0]
 
+    allowed_causes = incident.get("allowedRootCauses") or []
+
+    if not allowed_causes:
+        raise ValueError("No allowed root causes")
+
     return {
-        "rootCause": incident["allowedRootCauses"][0],
+        "rootCause": allowed_causes,[0]
         "evidence": evidence_ids[:2],
         "diagnostics": [
             {
                 "toolName": diagnostic_tool,
                 "arguments": {
-                    "incidentId": incident.get("incidentId"),
-                    "service": incident.get("service"),
+                    "incidentId": incident.get("incidentId", ""),
+                    "service": incident.get("service", ""),
                 },
-                "evidence": [evidence_ids][0],
+                "evidence": [evidence_ids],[0]
             }
         ],
         "effect": {
             "toolName": effect_tool,
             "arguments": {
-                "incidentId": incident.get("incidentId"),
-                "service": incident.get("service"),
+                "incidentId": incident.get("incidentId", ""),
+                "service": incident.get("service", ""),
             },
             "justification": "Fallback remediation based on available evidence",
         },
@@ -1237,13 +1245,24 @@ async def create_incident(request: Request) -> Response:
         traceback.print_exc()
         print("DEBUG: planner failed:", repr(exc))
 
-        return JSONResponse(
-            content={
-                "error": "planner_failed",
-                "message": str(exc),
-            },
-            status_code=502,
-        )
+        try:
+            plan = build_fallback_plan(
+                incident,
+                tool_catalog,
+                policy,
+            )
+            print("DEBUG: using fallback plan")
+        except Exception as fallback_exc:
+            traceback.print_exc()
+            print("DEBUG: fallback failed:", repr(fallback_exc))
+
+            return JSONResponse(
+                content={
+                    "error": "planner_failed",
+                    "message": str(fallback_exc),
+                },
+                status_code=502,
+            )
 
     plan = scrub_sensitive_text(plan, forbidden_values)
 
