@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+incident_agent.db
+incident_agent.db-*

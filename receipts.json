@@ -1,0 +1,21 @@
+{
+  "receiptId": "local_receipt_001",
+  "outcomes": [
+    {
+      "actionId": "diag_1_bab907dd738e",
+      "callId": "diag_1_bab907dd738e",
+      "attempt": 1,
+      "status": 200,
+      "resultClass": "diagnosis_confirmed",
+      "nonce": "local-nonce-diag-1"
+    },
+    {
+      "actionId": "diag_2_8b48008ce309",
+      "callId": "diag_2_8b48008ce309",
+      "attempt": 1,
+      "status": 200,
+      "resultClass": "diagnosis_confirmed",
+      "nonce": "local-nonce-diag-2"
+    }
+  ]
+}

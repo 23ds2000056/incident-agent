@@ -1,0 +1,39 @@
+{
+  "profile": "ga5-incident-agent/v2",
+  "runId": "local_test_run_001",
+  "agentName": "incident-response",
+  "publicMarker": "local-test-marker",
+  "sensitive": {
+    "accessToken": "never-export",
+    "privateNote": "never-export"
+  },
+  "incident": {
+    "incidentId": "inc_local_001",
+    "title": "Checkout latency incident",
+    "service": "checkout",
+    "severity": "SEV-1",
+    "transcript": "[ev_1] Checkout p99 latency increased at 10:02. [ev_2] Database connection pool usage reached 100%.",
+    "allowedRootCauses": [
+      "database_connection_pool_exhaustion",
+      "bad_deployment"
+    ]
+  },
+  "toolCatalog": [
+    {
+      "name": "query_metrics",
+      "description": "Query service metrics",
+      "inputSchema": {"type": "object"}
+    },
+    {
+      "name": "scale_service",
+      "description": "Scale a service",
+      "inputSchema": {"type": "object"}
+    }
+  ],
+  "policy": {
+    "maximumDiagnostics": 3,
+    "effectTools": ["scale_service"],
+    "approvalRequiredFor": ["rollback_deployment", "disable_feature"],
+    "doNotExport": ["accessToken", "privateNote"]
+  }
+}
