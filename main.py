@@ -609,7 +609,7 @@ def build_fallback_plan(
                     "incidentId": incident.get("incidentId"),
                     "service": incident.get("service"),
                 },
-                "evidence": [evidence_ids],[0]
+                "evidence": [evidence_ids][0],
             }
         ],
         "effect": {
