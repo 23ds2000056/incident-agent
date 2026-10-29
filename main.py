@@ -11,6 +11,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+import re
 
 load_dotenv(override=True)
 
@@ -31,6 +32,21 @@ MAX_RESPONSE_BYTES = 768 * 1024
 # Utilities
 # ---------------------------------------------------------------------------
 
+EVIDENCE_LINE_PATTERN = re.compile(r"^\s*\[[^\]]+\]", re.MULTILINE)
+
+
+def extract_evidence_transcript(transcript: str, max_lines: int = 100) -> str:
+    lines = [
+        line.strip()
+        for line in transcript.splitlines()
+        if EVIDENCE_LINE_PATTERN.match(line.strip())
+    ]
+
+    if not lines:
+        return transcript[:15000]
+
+    return "\n".join(lines[:max_lines])
+    
 def now_unix_nano() -> int:
     return int(time.time() * 1_000_000_000)
 
@@ -420,12 +436,16 @@ def build_user_prompt(
     tool_catalog: list,
     policy: dict,
 ) -> str:
+    filtered_transcript = extract_evidence_transcript(
+        incident.get("transcript", "")
+    )
+
     safe_incident = {
         "incidentId": incident.get("incidentId"),
         "title": incident.get("title"),
         "service": incident.get("service"),
         "severity": incident.get("severity"),
-        "transcript": incident.get("transcript"),
+        "transcript": filtered_transcript,
         "allowedRootCauses": incident.get("allowedRootCauses", []),
     }
 
