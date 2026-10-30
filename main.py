@@ -26,8 +26,10 @@ MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://aipipe.org/openai/v1")
 SUPPORTED_PROFILE = "ga5-incident-agent/v2"
 DESTRUCTIVE_TOOLS = {"rollback_deployment", "disable_feature"}
 MAX_RESPONSE_BYTES = 768 * 1024
-MAX_EVIDENCE_LINES = 25
-MAX_EVIDENCE_LINE_CHARS = 300
+MAX_EVIDENCE_LINES = 15
+MAX_EVIDENCE_LINE_CHARS = 250
+MAX_COMPLETION_TOKENS = 700
+MODEL_TIMEOUT_SECONDS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +445,7 @@ def extract_evidence_transcript(
     print(f"PROMPT EVIDENCE LINES: {len(lines)}")
 
     if not lines:
-        return transcript[:6000]
+        return transcript[:5000]
 
     return "\n".join(lines[:max_lines])
 
@@ -587,7 +589,7 @@ def build_fallback_plan(
                 for word in ("query", "metric", "log", "trace")
             )
         ),
-        tool_catalog[0]["name"],
+        tool_catalog["name"][0],
     )
 
     effect_tools = policy.get("effectTools", [])
@@ -686,10 +688,11 @@ async def call_model_planner(
             {"role": "user", "content": user_prompt},
         ],
         "reasoning_effort": "minimal",
+        "max_completion_tokens": MAX_COMPLETION_TOKENS,
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=MODEL_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 url,
                 headers=headers,
@@ -704,7 +707,7 @@ async def call_model_planner(
         response.raise_for_status()
 
         data = response.json()
-        content = data["choices"][0]["message"]["content"]
+        content = data["choices"]["message"]["content"][0]
         plan = extract_json_object(content)
 
     except httpx.HTTPStatusError as exc:
@@ -1251,7 +1254,7 @@ async def create_incident(request: Request) -> Response:
                 tool_catalog,
                 policy,
             )
-            print("DEBUG: using fallback plan")
+            print("DEBUG: using fallback plan after model failure")
         except Exception as fallback_exc:
             traceback.print_exc()
             print("DEBUG: fallback failed:", repr(fallback_exc))
