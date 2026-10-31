@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 
 load_dotenv()
 
-app = FastAPI(title="GA5 Incident Response Agent", version="2.2.0")
+app = FastAPI(title="GA5 Incident Response Agent", version="2.2.1")
 logger = logging.getLogger("uvicorn.error")
 
 DB_PATH = os.getenv("INCIDENT_DB_PATH", "/tmp/incident_agent.db")
@@ -846,7 +846,7 @@ def advance(state):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "2.2.0"}
+    return {"status": "ok", "version": "2.2.1"}
 
 
 @app.post("/v2/incidents")
@@ -915,12 +915,11 @@ async def create_incident(request: Request):
             "attempts": {},
             "tools": {},
             "approval": {},
-            "approvalRequiredFor": set(
+            "approvalRequiredFor": list(
                 body["policy"].get("approvalRequiredFor", [])
             ),
             "traceId": trace.group(1) if valid_parent else uuid.uuid4().hex,
             "remoteParentSpanId": trace.group(2) if valid_parent else None,
-            "tracestate": request.headers.get("tracestate"),
             "serverSpanId": span_id(),
             "agentSpanId": span_id(),
             "modelSpanId": span_id(),
