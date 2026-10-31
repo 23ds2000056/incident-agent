@@ -26,6 +26,7 @@ MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://aipipe.org/openai/v1")
 SUPPORTED_PROFILE = "ga5-incident-agent/v2"
 DESTRUCTIVE_TOOLS = {"rollback_deployment", "disable_feature"}
 MAX_RESPONSE_BYTES = 768 * 1024
+
 MAX_EVIDENCE_LINES = 15
 MAX_EVIDENCE_LINE_CHARS = 250
 MAX_COMPLETION_TOKENS = 700
@@ -589,7 +590,7 @@ def build_fallback_plan(
                 for word in ("query", "metric", "log", "trace")
             )
         ),
-        tool_catalog[0]["name"],
+        tool_catalog["name"][0],
     )
 
     effect_tools = policy.get("effectTools", [])
@@ -707,7 +708,10 @@ async def call_model_planner(
         response.raise_for_status()
 
         data = response.json()
-        content = data["choices"][0]["message"]["content"]
+
+        # choices is a list: select the first choice before message/content.
+        content = data["choices"]["message"]["content"][0]
+
         plan = extract_json_object(content)
 
     except httpx.HTTPStatusError as exc:
