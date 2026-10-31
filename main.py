@@ -616,19 +616,13 @@ def build_fallback_plan(
         "diagnostics": [
             {
                 "toolName": diagnostic_tool,
-                "arguments": {
-                    "incidentId": incident.get("incidentId", ""),
-                    "service": incident.get("service", ""),
-                },
+                "arguments": {},
                 "evidence": [evidence_ids][0],
             }
         ],
         "effect": {
             "toolName": effect_tool,
-            "arguments": {
-                "incidentId": incident.get("incidentId", ""),
-                "service": incident.get("service", ""),
-            },
+            "arguments": {},
             "justification": "Fallback remediation based on available evidence",
         },
     }
@@ -709,7 +703,7 @@ async def call_model_planner(
 
         data = response.json()
 
-        # choices is a list: select the first choice before message/content.
+        # `choices` is a list, so select the first choice first.
         content = data["choices"][0]["message"]["content"]
 
         plan = extract_json_object(content)
@@ -728,68 +722,125 @@ async def call_model_planner(
         print("=============================\n")
         raise
 
-    try:
-        allowed_causes = incident.get("allowedRootCauses", [])
+    return plan
 
-        if plan.get("rootCause") not in allowed_causes:
-            if allowed_causes:
-                plan["rootCause"] = allowed_causes[0]
-            else:
-                raise ValueError("No allowedRootCauses supplied")
 
-        evidence = plan.get("evidence") or []
-        evidence = [
-            item
-            for item in evidence
-            if isinstance(item, str) and item
+# ---------------------------------------------------------------------------
+# Plan validation and repair
+# ---------------------------------------------------------------------------
+
+def sanitize_plan(
+    plan: dict,
+    incident: dict,
+    tool_catalog: list,
+    policy: dict,
+) -> dict:
+    print("\n===== RAW MODEL PLAN =====")
+    print(canonical_json(plan))
+    print("==========================\n")
+
+    print(
+        "TOOL CATALOG NAMES:",
+        [
+            tool.get("name")
+            for tool in tool_catalog
+            if isinstance(tool, dict)
+        ],
+    )
+    print("EFFECT TOOLS:", policy.get("effectTools", []))
+
+    catalog_by_name = {
+        tool["name"]: tool
+        for tool in tool_catalog
+        if isinstance(tool, dict) and tool.get("name")
+    }
+
+    if not catalog_by_name:
+        raise ValueError("No valid diagnostic tools")
+
+    allowed_causes = incident.get("allowedRootCauses") or []
+
+    if not allowed_causes:
+        raise ValueError("No allowed root causes")
+
+    root_cause = plan.get("rootCause")
+    if root_cause not in allowed_causes:
+        root_cause = allowed_causes[0]
+
+    evidence = plan.get("evidence") or []
+    evidence = [
+        item for item in evidence
+        if isinstance(item, str) and item
+    ]
+    evidence = list(dict.fromkeys(evidence))
+
+    transcript_evidence_ids = extract_evidence_ids(
+        incident.get("transcript", "")
+    )
+
+    for evidence_id in transcript_evidence_ids:
+        if len(evidence) >= 2:
+            break
+        if evidence_id not in evidence:
+            evidence.append(evidence_id)
+
+    evidence = evidence[:4]
+
+    if len(evidence) < 2:
+        raise ValueError("Not enough evidence IDs")
+
+    diagnostics = plan.get("diagnostics") or []
+    clean_diagnostics = []
+
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+
+        tool_name = diagnostic.get("toolName")
+
+        if tool_name not in catalog_by_name:
+            continue
+
+        arguments = diagnostic.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        diagnostic_evidence = [
+            item for item in diagnostic.get("evidence", [])
+            if item in evidence
         ]
-        evidence = list(dict.fromkeys(evidence))
 
-        transcript_evidence_ids = extract_evidence_ids(
-            incident.get("transcript", "")
+        if not diagnostic_evidence:
+            diagnostic_evidence = [evidence][0]
+
+        clean_diagnostics.append(
+            {
+                "toolName": tool_name,
+                "arguments": arguments,
+                "evidence": diagnostic_evidence,
+            }
         )
 
-        for evidence_id in transcript_evidence_ids:
-            if len(evidence) >= 2:
-                break
-            if evidence_id not in evidence:
-                evidence.append(evidence_id)
+    if not clean_diagnostics:
+        first_tool_name = next(iter(catalog_by_name))
 
-        evidence = evidence[:4]
-
-        if len(evidence) < 2:
-            raise ValueError("Transcript did not contain two evidence IDs")
-
-        plan["evidence"] = evidence
-
-        diagnostics = plan.get("diagnostics") or []
-        diagnostics = [
-            item
-            for item in diagnostics
-            if isinstance(item, dict)
-            and item.get("toolName")
-            and isinstance(item.get("arguments"), dict)
-        ]
-
-        if not diagnostics:
-            raise ValueError("Model did not provide a valid diagnostic")
-
-        plan["diagnostics"] = diagnostics[:3]
-
-        plan["effect"] = choose_permitted_effect(
-            plan.get("effect") or {},
-            policy,
+        clean_diagnostics.append(
+            {
+                "toolName": first_tool_name,
+                "arguments": {},
+                "evidence": [evidence][0],
+            }
         )
 
-        return plan
+    effect = plan.get("effect") or {}
+    effect = choose_permitted_effect(effect, policy)
 
-    except Exception as exc:
-        print("DEBUG: model plan invalid, using fallback:", repr(exc))
-        return build_fallback_plan(
-            incident,
-            tool_catalog,
-            policy,
-        )
+    return {
+        "rootCause": root_cause,
+        "evidence": evidence,
+        "diagnostics": clean_diagnostics[:3],
+        "effect": effect,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1278,13 +1329,55 @@ async def create_incident(request: Request) -> Response:
     model_end = now_unix_nano()
 
     try:
+        plan = sanitize_plan(
+            plan,
+            incident,
+            tool_catalog,
+            policy,
+        )
+
         dispatches = initial_dispatches(
             plan,
             tool_catalog,
             trace_id,
         )
     except Exception as exc:
-        return error(422, "invalid_plan", str(exc))
+        import traceback
+        traceback.print_exc()
+        print("DEBUG: plan sanitization failed:", repr(exc))
+
+        try:
+            plan = build_fallback_plan(
+                incident,
+                tool_catalog,
+                policy,
+            )
+
+            plan = sanitize_plan(
+                plan,
+                incident,
+                tool_catalog,
+                policy,
+            )
+
+            dispatches = initial_dispatches(
+                plan,
+                tool_catalog,
+                trace_id,
+            )
+
+            print("DEBUG: using fallback plan after sanitization failure")
+        except Exception as fallback_exc:
+            traceback.print_exc()
+            print("DEBUG: fallback failed:", repr(fallback_exc))
+
+            return JSONResponse(
+                content={
+                    "error": "planner_failed",
+                    "message": str(fallback_exc),
+                },
+                status_code=502,
+            )
 
     state = {
         "status": "waiting",
