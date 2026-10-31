@@ -413,7 +413,29 @@ def sanitize_plan(plan, incident, catalog, policy):
             raise ValueError("Tool arguments must be an object")
         schema = tools.get(name, {}).get("inputSchema")
         if schema:
-            Draft202012Validator(schema).validate(arguments)
+            validator = Draft202012Validator(schema)
+            errors = sorted(
+                validator.iter_errors(arguments),
+                key=lambda error: list(error.absolute_path),
+            )
+
+            if errors:
+                details = [
+                    {
+                        "path": list(error.absolute_path),
+                        "message": error.message,
+                    }
+                    for error in errors
+                ]
+                logger.warning(
+                    "schema_validation_failed tool=%s errors=%s arguments=%s",
+                    name,
+                    canonical(details),
+                    canonical(arguments),
+                )
+                raise ValueError(
+                    f"Arguments do not match schema for {name}"
+                )
         if not effect:
             cited = call.get("evidence")
             if not (
@@ -768,9 +790,15 @@ async def create_incident(request: Request):
                 plan, incident, body["toolCatalog"], body["policy"]
             )
         except Exception as exc:
-            logger.warning("planner_failed type=%s", type(exc).__name__)
+            logger.warning(
+                "planner_failed type=%s error=%s plan=%s",
+                type(exc).__name__,
+                repr(exc),
+                canonical(plan) if "plan" in locals() else "no_plan",
+            )
             raise APIError(
-                502, "planner_failed",
+                502,
+                "planner_failed",
                 "Planner failed or returned an invalid plan; no effect dispatched",
             )
 
