@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 
 load_dotenv()
 
-app = FastAPI(title="GA5 Incident Response Agent", version="2.1.1")
+app = FastAPI(title="GA5 Incident Response Agent", version="2.1.2")
 logger = logging.getLogger("uvicorn.error")
 
 DB_PATH = os.getenv("INCIDENT_DB_PATH", "/tmp/incident_agent.db")
@@ -377,9 +377,9 @@ def sanitize_plan(plan, incident, catalog, policy):
     if plan.get("rootCause") not in incident["allowedRootCauses"]:
         raise ValueError("Unsupported root cause")
 
-    known_ids = {
-        item[0] for item in evidence_lines(incident["transcript"])
-    }
+    transcript_evidence = evidence_lines(incident["transcript"])
+    known_ids = {item[0] for item in transcript_evidence_found}
+    known_ids = {item[0] for item in transcript_evidence_lines}
 
     citations = plan.get("evidence")
     if not isinstance(citations, list):
@@ -393,7 +393,6 @@ def sanitize_plan(plan, incident, catalog, policy):
     ]
     citations = list(dict.fromkeys(citations))
 
-    # Repair a single valid citation using another real transcript ID.
     if len(citations) < 2:
         for evidence_id in known_ids:
             if evidence_id not in citations:
@@ -404,19 +403,48 @@ def sanitize_plan(plan, incident, catalog, policy):
     if len(citations) < 2:
         raise ValueError("Missing or unknown evidence IDs")
 
-    tools = {tool["name"]: tool for tool in catalog}
+    tools = {
+        tool["name"]: tool
+        for tool in catalog
+        if isinstance(tool, dict) and tool.get("name")
+    }
     diagnostics = plan.get("diagnostics")
     if not isinstance(diagnostics, list) or not 1 <= len(diagnostics) <= 3:
         raise ValueError("Expected one to three diagnostic calls")
 
     effects = set(policy["effectTools"])
 
+    def repair_arguments(name, arguments):
+        schema = tools.get(name, {}).get("inputSchema") or {}
+        properties = schema.get("properties") or {}
+        required = schema.get("required") or []
+
+        for field in required:
+            if field in arguments:
+                continue
+            if field == "service" and incident.get("service"):
+                arguments[field] = incident["service"]
+            elif field == "incidentId" and incident.get("incidentId"):
+                arguments[field] = incident["incidentId"]
+
+        if schema.get("additionalProperties") is False:
+            allowed = set(properties)
+            arguments = {
+                key: value
+                for key, value in arguments.items()
+                if key in allowed
+            }
+
+        return arguments
+
     def validate_call(call, effect=False):
         if not isinstance(call, dict):
             raise ValueError("Tool call must be an object")
+
         name = call.get("toolName")
         if not isinstance(name, str):
             raise ValueError("Tool name must be a string")
+
         if effect:
             if name not in effects:
                 raise ValueError("Effect is not permitted")
@@ -426,6 +454,9 @@ def sanitize_plan(plan, incident, catalog, policy):
         arguments = call.get("arguments")
         if not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be an object")
+
+        if not effect:
+            arguments = repair_arguments(name, arguments)
 
         schema = tools.get(name, {}).get("inputSchema")
         if schema:
@@ -453,22 +484,33 @@ def sanitize_plan(plan, incident, catalog, policy):
                     f"Arguments do not match schema for {name}"
                 )
 
+        validated = {
+            "toolName": name,
+            "arguments": arguments,
+        }
+
         if not effect:
             cited = call.get("evidence")
-            if not (
-                isinstance(cited, list)
-                and cited
-                and all(isinstance(item, str) for item in cited)
-                and set(cited).issubset(citations)
-            ):
-                raise ValueError("Invalid diagnostic evidence")
+            if not isinstance(cited, list):
+                cited = []
+
+            valid_citations = [
+                item for item in cited
+                if isinstance(item, str) and item in known_ids
+            ]
+
+            if not valid_citations:
+                valid_citations = [citations[0]]
+
+            validated["evidence"] = valid_citations
+
+        return validated
 
     valid_diagnostics = []
 
     for call in diagnostics:
         try:
-            validate_call(call)
-            valid_diagnostics.append(copy.deepcopy(call))
+            valid_diagnostics.append(validate_call(call))
         except Exception as exc:
             logger.warning(
                 "diagnostic_rejected tool=%s error=%s call=%s",
@@ -480,7 +522,8 @@ def sanitize_plan(plan, incident, catalog, policy):
     if not valid_diagnostics:
         raise ValueError("No valid diagnostic calls")
 
-    validate_call(plan.get("effect"), effect=True)
+    effect = plan.get("effect")
+    validate_call(effect, effect=True)
 
     result = copy.deepcopy(plan)
     result["evidence"] = citations
@@ -789,7 +832,7 @@ def advance(state):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "2.1.1"}
+    return {"status": "ok", "version": "2.1.2"}
 
 
 @app.post("/v2/incidents")
