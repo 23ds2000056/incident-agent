@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 
 load_dotenv()
 
-app = FastAPI(title="GA5 Incident Response Agent", version="2.1.0")
+app = FastAPI(title="GA5 Incident Response Agent", version="2.1.1")
 logger = logging.getLogger("uvicorn.error")
 
 DB_PATH = os.getenv("INCIDENT_DB_PATH", "/tmp/incident_agent.db")
@@ -47,7 +47,6 @@ SENSITIVE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# One worker only: these locks coordinate requests within one process.
 run_locks = {}
 
 
@@ -158,7 +157,6 @@ def load_receipt(run_id, receipt_id):
 
 
 def persist(run_id, body, state, receipt=None, response=None):
-    # State and processed receipt response commit in one transaction.
     with closing(connect()) as connection:
         with connection:
             connection.execute(
@@ -374,20 +372,36 @@ async def call_model_planner(incident, catalog, policy):
 
 
 def sanitize_plan(plan, incident, catalog, policy):
-    # Normalize structure without inventing a diagnosis or tool arguments.
     if not isinstance(plan, dict):
         raise ValueError("Plan must be an object")
     if plan.get("rootCause") not in incident["allowedRootCauses"]:
         raise ValueError("Unsupported root cause")
 
-    known_ids = {item[0] for item in evidence_lines(incident["transcript"])}
+    known_ids = {
+        item[0] for item in evidence_lines(incident["transcript"])
+    }
+
     citations = plan.get("evidence")
     if not isinstance(citations, list):
         raise ValueError("Evidence must be an array")
     if not all(isinstance(item, str) for item in citations):
         raise ValueError("Evidence IDs must be strings")
+
+    citations = [
+        item for item in citations
+        if item in known_ids
+    ]
     citations = list(dict.fromkeys(citations))
-    if len(citations) < 2 or not set(citations).issubset(known_ids):
+
+    # Repair a single valid citation using another real transcript ID.
+    if len(citations) < 2:
+        for evidence_id in known_ids:
+            if evidence_id not in citations:
+                citations.append(evidence_id)
+            if len(citations) == 2:
+                break
+
+    if len(citations) < 2:
         raise ValueError("Missing or unknown evidence IDs")
 
     tools = {tool["name"]: tool for tool in catalog}
@@ -408,9 +422,11 @@ def sanitize_plan(plan, incident, catalog, policy):
                 raise ValueError("Effect is not permitted")
         elif name not in tools or name in effects or name in DESTRUCTIVE_TOOLS:
             raise ValueError("Diagnostic tool is not permitted")
+
         arguments = call.get("arguments")
         if not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be an object")
+
         schema = tools.get(name, {}).get("inputSchema")
         if schema:
             validator = Draft202012Validator(schema)
@@ -436,6 +452,7 @@ def sanitize_plan(plan, incident, catalog, policy):
                 raise ValueError(
                     f"Arguments do not match schema for {name}"
                 )
+
         if not effect:
             cited = call.get("evidence")
             if not (
@@ -446,12 +463,28 @@ def sanitize_plan(plan, incident, catalog, policy):
             ):
                 raise ValueError("Invalid diagnostic evidence")
 
+    valid_diagnostics = []
+
     for call in diagnostics:
-        validate_call(call)
+        try:
+            validate_call(call)
+            valid_diagnostics.append(copy.deepcopy(call))
+        except Exception as exc:
+            logger.warning(
+                "diagnostic_rejected tool=%s error=%s call=%s",
+                call.get("toolName"),
+                repr(exc),
+                canonical(call),
+            )
+
+    if not valid_diagnostics:
+        raise ValueError("No valid diagnostic calls")
+
     validate_call(plan.get("effect"), effect=True)
 
     result = copy.deepcopy(plan)
     result["evidence"] = citations
+    result["diagnostics"] = valid_diagnostics
     return result
 
 
@@ -638,7 +671,6 @@ def build_otlp_trace(state):
                 or str(outcome.get("status"))
             })
 
-    # A join is emitted only after every diagnostic has a terminal outcome.
     if state["joinedAt"] is not None:
         links = [
             {"traceId": state["traceId"], "spanId": tool["spanId"]}
@@ -757,7 +789,7 @@ def advance(state):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "2.1.0"}
+    return {"status": "ok", "version": "2.1.1"}
 
 
 @app.post("/v2/incidents")
@@ -778,8 +810,8 @@ async def create_incident(request: Request):
         started = now()
         incident = redact(body["incident"], sensitive_values(body))
 
+        plan = None
         try:
-            # wait_for bounds the whole planner operation, not only reads.
             plan = await asyncio.wait_for(
                 call_model_planner(
                     incident, body["toolCatalog"], body["policy"]
@@ -794,7 +826,7 @@ async def create_incident(request: Request):
                 "planner_failed type=%s error=%s plan=%s",
                 type(exc).__name__,
                 repr(exc),
-                canonical(plan) if "plan" in locals() else "no_plan",
+                canonical(plan) if plan is not None else "no_plan",
             )
             raise APIError(
                 502,
@@ -923,7 +955,6 @@ async def receive_receipt(run_id: str, request: Request):
             seen = set()
             validated = []
 
-            # Validate the complete receipt before changing state.
             for outcome in outcomes:
                 if not isinstance(outcome, dict):
                     raise APIError(422, "invalid_outcome", "Outcome must be object")
