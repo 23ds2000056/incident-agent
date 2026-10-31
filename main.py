@@ -729,11 +729,15 @@ def build_otlp_trace(state):
                 or str(outcome.get("status"))
             })
 
-    if state["joinedAt"] is not None:
+    diagnostic_tools = [
+        tool for tool in state["tools"].values()
+        if tool["phase"] == "diagnostic"
+    ]
+
+    if state["joinedAt"] is not None and len(diagnostic_tools) > 1:
         links = [
             {"traceId": state["traceId"], "spanId": tool["spanId"]}
-            for tool in state["tools"].values()
-            if tool["phase"] == "diagnostic"
+            for tool in diagnostic_tools
         ]
         add(
             state["joinSpanId"], state["agentSpanId"],
