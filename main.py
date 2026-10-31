@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 
 load_dotenv()
 
-app = FastAPI(title="GA5 Incident Response Agent", version="2.1.2")
+app = FastAPI(title="GA5 Incident Response Agent", version="2.1.3")
 logger = logging.getLogger("uvicorn.error")
 
 DB_PATH = os.getenv("INCIDENT_DB_PATH", "/tmp/incident_agent.db")
@@ -377,8 +377,7 @@ def sanitize_plan(plan, incident, catalog, policy):
     if plan.get("rootCause") not in incident["allowedRootCauses"]:
         raise ValueError("Unsupported root cause")
 
-    transcript_evidence = evidence_lines(incident["transcript"])
-    known_ids = {item[0] for item in transcript_evidence_found}
+    transcript_evidence_lines = evidence_lines(incident["transcript"])
     known_ids = {item[0] for item in transcript_evidence_lines}
 
     citations = plan.get("evidence")
@@ -832,7 +831,7 @@ def advance(state):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "2.1.2"}
+    return {"status": "ok", "version": "2.1.3"}
 
 
 @app.post("/v2/incidents")
