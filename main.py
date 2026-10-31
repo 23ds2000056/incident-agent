@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 
 load_dotenv()
 
-app = FastAPI(title="GA5 Incident Response Agent", version="2.1.3")
+app = FastAPI(title="GA5 Incident Response Agent", version="2.2.0")
 logger = logging.getLogger("uvicorn.error")
 
 DB_PATH = os.getenv("INCIDENT_DB_PATH", "/tmp/incident_agent.db")
@@ -30,7 +30,6 @@ MODEL_BASE_URL = os.getenv(
 ).rstrip("/")
 
 PROFILE = "ga5-incident-agent/v2"
-DESTRUCTIVE_TOOLS = {"rollback_deployment", "disable_feature"}
 MAX_EVIDENCE_LINES = 15
 MAX_EVIDENCE_LINE_CHARS = 250
 MAX_COMPLETION_TOKENS = 700
@@ -109,13 +108,13 @@ def init_db():
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS runs_v21 (
+            CREATE TABLE IF NOT EXISTS runs_v22 (
                 run_id TEXT PRIMARY KEY,
                 fingerprint TEXT NOT NULL,
                 request_json TEXT NOT NULL,
                 state_json TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS receipts_v21 (
+            CREATE TABLE IF NOT EXISTS receipts_v22 (
                 run_id TEXT NOT NULL,
                 receipt_id TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
@@ -133,7 +132,7 @@ init_db()
 def load_run(run_id):
     with closing(connect()) as connection:
         row = connection.execute(
-            "SELECT * FROM runs_v21 WHERE run_id = ?", (run_id,)
+            "SELECT * FROM runs_v22 WHERE run_id = ?", (run_id,)
         ).fetchone()
     if not row:
         return None
@@ -148,7 +147,7 @@ def load_receipt(run_id, receipt_id):
     with closing(connect()) as connection:
         row = connection.execute(
             """
-            SELECT fingerprint, response_json FROM receipts_v21
+            SELECT fingerprint, response_json FROM receipts_v22
             WHERE run_id = ? AND receipt_id = ?
             """,
             (run_id, receipt_id),
@@ -161,7 +160,7 @@ def persist(run_id, body, state, receipt=None, response=None):
         with connection:
             connection.execute(
                 """
-                INSERT INTO runs_v21
+                INSERT INTO runs_v22
                 (run_id, fingerprint, request_json, state_json)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
@@ -177,7 +176,7 @@ def persist(run_id, body, state, receipt=None, response=None):
             if receipt is not None:
                 connection.execute(
                     """
-                    INSERT INTO receipts_v21
+                    INSERT INTO receipts_v22
                     (run_id, receipt_id, fingerprint, response_json)
                     VALUES (?, ?, ?, ?)
                     """,
@@ -377,8 +376,8 @@ def sanitize_plan(plan, incident, catalog, policy):
     if plan.get("rootCause") not in incident["allowedRootCauses"]:
         raise ValueError("Unsupported root cause")
 
-    transcript_evidence_lines = evidence_lines(incident["transcript"])
-    known_ids = {item[0] for item in transcript_evidence_lines}
+    transcript_evidence = evidence_lines(incident["transcript"])
+    known_ids = {item[0] for item in transcript_evidence}
 
     citations = plan.get("evidence")
     if not isinstance(citations, list):
@@ -402,16 +401,27 @@ def sanitize_plan(plan, incident, catalog, policy):
     if len(citations) < 2:
         raise ValueError("Missing or unknown evidence IDs")
 
+    citations = citations[:4]
+
     tools = {
         tool["name"]: tool
         for tool in catalog
         if isinstance(tool, dict) and tool.get("name")
     }
     diagnostics = plan.get("diagnostics")
-    if not isinstance(diagnostics, list) or not 1 <= len(diagnostics) <= 3:
-        raise ValueError("Expected one to three diagnostic calls")
+    maximum_diagnostics = max(
+        1, min(3, int(policy.get("maximumDiagnostics", 3)))
+    )
+
+    if not isinstance(diagnostics, list) or not (
+        1 <= len(diagnostics) <= maximum_diagnostics
+    ):
+        raise ValueError(
+            f"Expected one to {maximum_diagnostics} diagnostic calls"
+        )
 
     effects = set(policy["effectTools"])
+    approval_required = set(policy.get("approvalRequiredFor", []))
 
     def repair_arguments(name, arguments):
         schema = tools.get(name, {}).get("inputSchema") or {}
@@ -447,7 +457,13 @@ def sanitize_plan(plan, incident, catalog, policy):
         if effect:
             if name not in effects:
                 raise ValueError("Effect is not permitted")
-        elif name not in tools or name in effects or name in DESTRUCTIVE_TOOLS:
+            if name not in tools:
+                raise ValueError("Effect tool must be in toolCatalog")
+        elif (
+            name not in tools
+            or name in effects
+            or name in approval_required
+        ):
             raise ValueError("Diagnostic tool is not permitted")
 
         arguments = call.get("arguments")
@@ -495,13 +511,13 @@ def sanitize_plan(plan, incident, catalog, policy):
 
             valid_citations = [
                 item for item in cited
-                if isinstance(item, str) and item in known_ids
+                if isinstance(item, str) and item in citations
             ]
 
             if not valid_citations:
                 valid_citations = [citations[0]]
 
-            validated["evidence"] = valid_citations
+            validated["evidence"] = list(dict.fromkeys(valid_citations))
 
         return validated
 
@@ -596,10 +612,10 @@ def add_dispatch(state, call, phase, approval=None, retry_of=None):
         dispatch["approvalId"] = approval["approvalId"]
         dispatch["approvalNonce"] = approval["nonce"]
 
-    if dispatch["toolName"] in DESTRUCTIVE_TOOLS and not (
+    if dispatch["toolName"] in state["approvalRequiredFor"] and not (
         dispatch.get("approvalId") and dispatch.get("approvalNonce")
     ):
-        raise ValueError("Destructive dispatch requires approval")
+        raise ValueError("Approval-required dispatch lacks approval")
 
     logical_key = dispatch["callId"]
     if logical_key not in state["tools"]:
@@ -747,7 +763,7 @@ def build_otlp_trace(state):
                 "attributes": attrs({"service.name": "incident-response"})
             },
             "scopeSpans": [{
-                "scope": {"name": "ga5-incident-agent", "version": "2.1"},
+                "scope": {"name": "ga5-incident-agent", "version": "2.2"},
                 "spans": spans,
             }],
         }]
@@ -755,35 +771,33 @@ def build_otlp_trace(state):
 
 
 def public_state(state, body):
-    diagnostic_dispatches = [
-        item for item in state["actionLog"]
-        if item["phase"] == "diagnostic"
-    ]
     payload = {
         "runId": state["runId"],
         "status": state["status"],
-        "proposal": {
-            **state["diagnosis"],
-            "diagnostics": diagnostic_dispatches,
-            "effect": state["plannedEffect"],
-        },
         "diagnosis": state["diagnosis"],
         "chosenEffect": state["chosenEffect"],
-        "effectResult": state["effectResult"],
         "suppressed": state["suppressed"],
-        "dispatches": state["pendingDispatches"],
-        "approvals": (
-            [state["approval"]]
-            if state.get("approval", {}).get("status") == "pending"
-            else []
-        ),
         "actionLog": state["actionLog"],
         "receiptLog": state["receiptLog"],
         "otlp": build_otlp_trace(state),
     }
+
+    if state["status"] == "waiting":
+        payload["dispatches"] = state["pendingDispatches"]
+        payload["approvals"] = (
+            [state["approval"]]
+            if state.get("approval", {}).get("status") == "pending"
+            else []
+        )
+    else:
+        payload["dispatches"] = []
+        payload["approvals"] = []
+
     payload = redact(payload, sensitive_values(body))
+
     if len(canonical(payload).encode()) > MAX_RESPONSE_BYTES:
         raise APIError(500, "response_too_large", "Response exceeds size limit")
+
     return payload
 
 
@@ -816,7 +830,8 @@ def advance(state):
 
     effect = state["plannedEffect"]
     state["chosenEffect"] = effect["toolName"]
-    if effect["toolName"] in DESTRUCTIVE_TOOLS:
+
+    if effect["toolName"] in state["approvalRequiredFor"]:
         state["approval"] = {
             "approvalId": uid("approval"),
             "actionId": uid("effect"),
@@ -831,7 +846,7 @@ def advance(state):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "2.1.3"}
+    return {"status": "ok", "version": "2.2.0"}
 
 
 @app.post("/v2/incidents")
@@ -882,6 +897,7 @@ async def create_incident(request: Request):
             and trace.group(1) != "0" * 32
             and trace.group(2) != "0" * 16
         )
+
         state = {
             "runId": run_id,
             "publicMarker": body.get("publicMarker", ""),
@@ -892,7 +908,6 @@ async def create_incident(request: Request):
             },
             "plannedEffect": plan["effect"],
             "chosenEffect": None,
-            "effectResult": None,
             "suppressed": [],
             "pendingDispatches": [],
             "actionLog": [],
@@ -900,8 +915,12 @@ async def create_incident(request: Request):
             "attempts": {},
             "tools": {},
             "approval": {},
+            "approvalRequiredFor": set(
+                body["policy"].get("approvalRequiredFor", [])
+            ),
             "traceId": trace.group(1) if valid_parent else uuid.uuid4().hex,
             "remoteParentSpanId": trace.group(2) if valid_parent else None,
+            "tracestate": request.headers.get("tracestate"),
             "serverSpanId": span_id(),
             "agentSpanId": span_id(),
             "modelSpanId": span_id(),
@@ -913,8 +932,10 @@ async def create_incident(request: Request):
             "joinedAt": None,
             "updatedAt": now(),
         }
+
         for diagnostic in plan["diagnostics"]:
             add_dispatch(state, diagnostic, "diagnostic")
+
         state["updatedAt"] = now()
         response = public_state(state, body)
         persist(run_id, body, state)
@@ -951,6 +972,7 @@ async def receive_receipt(run_id: str, request: Request):
                 and isinstance(approvals[0], dict)
             ):
                 raise APIError(422, "invalid_approval", "Invalid approvals array")
+
             incoming = approvals[0]
             pending = state["approval"]
             if (
@@ -959,6 +981,7 @@ async def receive_receipt(run_id: str, request: Request):
                 or incoming.get("approvalId") != pending["approvalId"]
             ):
                 raise APIError(422, "unknown_approval", "Approval is not pending")
+
             decision = incoming.get("decision")
             nonce = incoming.get("nonce")
             if decision not in {"approved", "rejected"}:
@@ -972,9 +995,14 @@ async def receive_receipt(run_id: str, request: Request):
                 "receiptId": receipt_id,
                 "end": now(),
             })
+
             state["receiptLog"].append({
-                "receiptId": receipt_id, **copy.deepcopy(incoming)
+                "receiptId": receipt_id,
+                "approvalId": incoming["approvalId"],
+                "decision": incoming["decision"],
+                "nonce": incoming["nonce"],
             })
+
             if decision == "approved":
                 add_dispatch(
                     state, state["plannedEffect"], "effect", approval=pending
@@ -1016,15 +1044,23 @@ async def receive_receipt(run_id: str, request: Request):
             state["pendingDispatches"] = [
                 item for key, item in pending.items() if key not in seen
             ]
+
             for key, dispatch, outcome in validated:
-                recorded = copy.deepcopy(outcome)
-                recorded["receiptId"] = receipt_id
+                recorded = {
+                    "receiptId": receipt_id,
+                    "actionId": outcome["actionId"],
+                    "callId": outcome["callId"],
+                    "attempt": outcome["attempt"],
+                    "status": outcome["status"],
+                    "resultClass": outcome.get("resultClass", ""),
+                    "nonce": outcome["nonce"],
+                }
+
                 state["attempts"][key]["outcome"] = recorded
                 state["attempts"][key]["end"] = now()
                 state["receiptLog"].append(recorded)
 
                 if dispatch["phase"] == "effect":
-                    state["effectResult"] = recorded
                     state["status"] = (
                         "completed" if outcome["status"] == 200 else "failed"
                     )
@@ -1032,6 +1068,7 @@ async def receive_receipt(run_id: str, request: Request):
                     add_dispatch(
                         state, dispatch, "diagnostic", retry_of=dispatch
                     )
+
             advance(state)
 
         state["updatedAt"] = now()
